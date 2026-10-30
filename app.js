@@ -22,7 +22,7 @@ const closeModal=()=>{const m=$('#modal');m.classList.remove('on');m.innerHTML='
 function intl(raw){const s=String(raw||'').trim(),d=s.replace(/\D/g,'');if(!d)return'';const cc=String(C.countryCode||'225');
   if(s.startsWith('+'))return d;if(d.startsWith('00'))return d.slice(2);if(d.startsWith(cc)&&d.length>=cc.length+8)return d;return cc+d}
 
-let DB,user=null,deferred=null,S={rdv:[],cfg:{},notes:[],ready:false},lastTab=null;
+let DB,user=null,deferred=window.__ip||null,S={rdv:[],cfg:{},notes:[],ready:false},lastTab=null;
 const blank=()=>({old:null,name:'',phone:'',same:true,wa:'',date:null,time:null,dur:null,urg:'normal',note:'',perso:'',keep:null,done:false,created:null});
 const bk0=()=>({from:today(),to:today(),all:true,start:'12:00',end:'14:00',reason:''});
 let F=blank(),P={tab:'agenda',day:0,seg:'todo',month:new Date(),sel:null,bk:bk0(),tOpen:true,tY:null};
@@ -75,10 +75,12 @@ const FB={mode:'firebase',
   logout(){return firebase.auth().signOut()}};
 const loadJs=u=>new Promise((ok,ko)=>{const s=document.createElement('script');s.src=u;s.onload=ok;s.onerror=ko;document.head.appendChild(s)});
 
+/* nom de la marque : même écriture partout */
+function brandHtml(n){return esc(n).replace(/^(ven)(.*)$/i,'$1<span>$2</span>')}
 /* ---------- installation, site officiel, soutien ---------- */
 const SITE=C.siteUrl||'https://vencraft-ci.github.io/site-officiel/',PAY=C.payUrl||'https://pay.wave.com/m/M_ci_x2YYqnMBS-fb/c/ci/';
 const standalone=()=>(window.matchMedia&&matchMedia('(display-mode: standalone)').matches)||navigator.standalone;
-const isIOS=()=>/iphone|ipad|ipod/i.test(navigator.userAgent);
+const isIOS=()=>/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 const isAndroid=()=>/android/i.test(navigator.userAgent);
 const lnk=(u,t,c)=>`<a class="${c}" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${t}</a>`;
 addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferred=e;refresh()});
@@ -87,7 +89,7 @@ addEventListener('appinstalled',()=>{deferred=null;toast('Application installée
 function instBtn(){return standalone()?'':'<button class=hinst data-a=install aria-label="Installer l\'application">Installer <span aria-hidden=true>➜</span></button>'}
 /* carte VENCRAFT-CI en haut des réglages */
 function vcCard(){
-  return`<section class="card vcard"><div class=vname>VENCRAFT-CI</div><p class=vtag>Aux côtés de ceux qui bâtissent.</p>
+  return`<section class="card vcard"><div class="vname brand">${brandHtml(cfg().name)}</div><p class=vtag>Aux côtés de ceux qui bâtissent.</p>
   ${lnk(SITE,'Visiter le site officiel','btn site big')}
   <div class=vcof><h3>☕ Soutenir le projet</h3><p>Offrir un café, si vous le souhaitez.</p>${lnk(PAY,'☕ Offrir un café','btn gold big')}<p class=hint>Votre soutien est libre et facultatif.</p></div></section>`}
 
@@ -310,32 +312,72 @@ async function saveNote(auto){
   N={...N,...blankN()};toast(auto?'Note vocale enregistrée':'Note enregistrée');render()}
 /* dictée vocale : fonction du navigateur (Chrome Android surtout), connexion internet nécessaire */
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let PS=false;
+/* dictée : on garde seulement les phrases TERMINÉES (jamais les brouillons), une session à la fois, relancée automatiquement : plus aucun mot doublé */
 function micStart(){
   if(!SR)return toast("La dictée vocale n'est pas disponible sur ce navigateur. Utilisez le micro du clavier de votre téléphone.");
-  const base=N.text.trim();let live='';
-  const r=new SR();r.lang='fr-FR';r.continuous=true;r.interimResults=true;
-  r.onresult=e=>{live=Array.from(e.results).map(x=>x[0].transcript).join(' ').replace(/\s+/g,' ').trim();N.text=(base?base+' ':'')+live;const t=$('#ntx');if(t)t.value=N.text};
-  r.onerror=e=>{N.err=e&&e.error};
-  r.onend=()=>{REC=null;N.rec=false;const err=N.err;N.err=null;
-    if(live){N.text=(base?base+' ':'')+live;saveNote(true)}
-    else{render();toast(err==='not-allowed'||err==='service-not-allowed'?'Micro refusé : autorisez le micro pour ce site dans les réglages du navigateur.':err==='network'?'La dictée vocale demande une connexion internet.':'Aucune voix détectée. Réessayez.')}};
-  try{r.start();REC=r;N.rec=true;render()}catch{REC=null;N.rec=false;toast('Impossible de démarrer le micro')}}
+  const base=N.text.trim();let fin='',stopped=false,fatal=null,cur=null,heard=false,idle=0,got=false;
+  const show=live=>{N.text=[base,fin,live].map(x=>(x||'').trim()).filter(Boolean).join(' ');const t=$('#ntx');if(t)t.value=N.text};
+  const norm2=s=>s.toLowerCase().replace(/[^a-zà-ÿ0-9]+/g,' ').trim();
+  const begin=()=>{
+    got=false;const r=new SR();cur=r;r.lang='fr-FR';r.continuous=false;r.interimResults=true;r.maxAlternatives=1;
+    r.onresult=e=>{let live='',f='';
+      for(let i=e.resultIndex;i<e.results.length;i++){const t=e.results[i][0].transcript;if(e.results[i].isFinal)f+=' '+t;else live+=' '+t}
+      f=f.trim();
+      if(f){heard=true;got=true;idle=0;const a=norm2(f),b=norm2(fin);
+        /* on ignore un morceau déjà présent à la fin du texte (répétition envoyée par certains téléphones) */
+        if(!(a&&b.endsWith(a)))fin=(fin+' '+f).trim();live=''}
+      show(live.trim())};
+    r.onerror=e=>{const k=e&&e.error;if(k==='not-allowed'||k==='service-not-allowed'||k==='network'||k==='audio-capture')fatal=k};
+    r.onend=()=>{
+      if(!got)idle++;
+      if(idle>=3&&!stopped&&!fatal){stopped=true;toast('Dictée arrêtée : aucune voix détectée')}
+      if(!stopped&&!fatal){setTimeout(()=>{if(!stopped){try{begin()}catch{stopped=true;finish()}}},200);return}
+      finish()};
+    r.start()};
+  const finish=()=>{REC=null;N.rec=false;show('');const sv=PS;PS=false;
+    if(fatal&&!heard)toast(fatal==='network'?'La dictée vocale demande une connexion internet.':'Micro refusé : autorisez le micro pour ce site dans les réglages du navigateur.');
+    if(sv)saveNote(false);else render()};
+  REC={stop(){stopped=true;try{cur&&cur.stop()}catch{}}};
+  try{N.rec=true;begin();render()}catch{REC=null;N.rec=false;toast('Impossible de démarrer le micro')}}
 
 /* rappels : au plus 2 par rendez-vous (la veille, puis quand l'heure approche), jamais répétés */
 const nfl=()=>{try{return JSON.parse(localStorage.agenda_notifs)||{}}catch{return{}}};
-function checkNotifs(){
-  if(!S.ready||!user)return;
-  const f=nfl(),now=new Date(),td=today(),tm=iso(add(now,1)),mins=now.getHours()*60+now.getMinutes(),live=new Set(S.rdv.map(r=>r.sid));let ch=false;
-  Object.keys(f).forEach(k=>{if(!live.has(k.split('|')[0])){delete f[k];ch=true}});
-  const j1=S.rdv.filter(r=>!r.done&&r.date===tm&&!f[r.sid+'|j1']&&Date.now()-(+r.created||0)>2*36e5).sort((a,b)=>a.time.localeCompare(b.time));
-  if(j1.length){j1.forEach(r=>{f[r.sid+'|j1']=Date.now()});ch=true;
-    NT.push({t:j1.length>1?'Demain : '+j1.length+' rendez-vous':'Demain : 1 rendez-vous',m:j1.slice(0,5).map(r=>r.name+' à '+r.time).join(' · ')+(j1.length>5?' …':'')})}
-  S.rdv.filter(r=>!r.done&&r.date===td&&!f[r.sid+'|j0']).forEach(r=>{const diff=t2m(r.time)-mins;
-    if(diff<=60&&diff>=-15){f[r.sid+'|j0']=Date.now();ch=true;NT.push({t:'Rendez-vous bientôt',m:r.name+' à '+r.time+(diff>0?' (dans '+diff+' min)':' (maintenant)')})}});
-  if(ch){try{localStorage.agenda_notifs=JSON.stringify(f)}catch{}if(NT.length>6)NT=NT.slice(-6);refresh()}}
 const ntHtml=()=>NT.map((n,i)=>`<div class=ntf role=status><div><b>${esc(n.t)}</b><br>${esc(n.m)}</div><button class=x data-a=ntx data-i=${i} aria-label=Fermer>✕</button></div>`).join('');
 
+/* guide visuel d'installation (iPhone, iPad, iPod) : Apple ne permet pas l'installation automatique */
+const SVG=p=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
+const IG={safari:SVG('<circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/>'),
+  share:SVG('<path d="M12 3v12M8 7l4-4 4 4"/><path d="M7 11H6a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-1"/>'),
+  plus:SVG('<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/>'),
+  ok:SVG('<path d="M5 12.5l4.5 4.5L19 7.5"/>')};
+const inApp=()=>/FBAN|FBAV|FB_IAB|Instagram|WhatsApp|Line\/|Snapchat|TikTok|MicroMessenger|GSA\/|Twitter/i.test(navigator.userAgent);
+function iosGuide(){
+  const warn=inApp()?`<div class=igw><b>Vous êtes dans une autre application</b> (WhatsApp, Facebook…). Touchez <b>⋯</b> ou l'icône de boussole, puis <b>Ouvrir dans Safari</b>. Ensuite revenez ici.</div>`:'';
+  return`<h3>Installer sur iPhone / iPad</h3><p class=hint style="margin:4px 0 0">4 gestes, une seule fois. L'application aura son icône sur votre écran d'accueil.</p>${warn}
+  <ol class=ig>
+  <li><span class=igi>${IG.safari}</span><span><b>Ouvrez cette page dans Safari</b><small>Le navigateur bleu avec une boussole.</small></span></li>
+  <li><span class=igi>${IG.share}</span><span><b>Touchez « Partager »</b><small>Carré avec une flèche vers le haut. iPhone : en bas de l'écran. iPad : en haut. Si vous ne le voyez pas, touchez d'abord <b>⋯</b>.</small></span></li>
+  <li><span class=igi>${IG.plus}</span><span><b>Touchez « Sur l'écran d'accueil »</b><small>Faites défiler le menu vers le haut si besoin.</small></span></li>
+  <li><span class=igi>${IG.ok}</span><span><b>Touchez « Ajouter »</b><small>En haut à droite. L'icône apparaît sur votre écran.</small></span></li></ol>
+  <button class="btn gold big" data-a=close style="margin-top:14px">J'ai compris</button>`}
 const NTA={
+  cal(d){const r=S.rdv.find(x=>x.sid===d.s);if(!r||!okDate(r.date)||!/^\d{1,2}:\d{2}$/.test(r.time||''))return toast('Rendez-vous introuvable');
+    const p2=n=>String(n).padStart(2,'0'),stt=pd(r.date),[h,m]=r.time.split(':');stt.setHours(+h,+m,0,0);
+    const en=new Date(stt.getTime()+(+(r.dur||cfg().slot)||30)*6e4),fmt=x=>x.getFullYear()+p2(x.getMonth()+1)+p2(x.getDate())+'T'+p2(x.getHours())+p2(x.getMinutes())+'00',
+      e=s=>String(s||'').replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r?\n/g,'\\n'),
+      rm=Math.max(5,Math.min(1440,+cfg().remMin||60)),nm=cfg().name||'Agenda',
+      txt=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//'+e(nm)+'//Agenda//FR','CALSCALE:GREGORIAN','METHOD:PUBLISH','BEGIN:VEVENT',
+        'UID:'+String(r.sid).replace(/[^A-Za-z0-9_-]/g,'')+'-'+fmt(stt)+'@agenda','DTSTAMP:'+new Date().toISOString().replace(/[-:]|\.\d{3}/g,''),
+        'DTSTART:'+fmt(stt),'DTEND:'+fmt(en),'SUMMARY:'+e('RDV : '+r.name),
+        'DESCRIPTION:'+e((r.phone?'Tél : '+r.phone:'')+(r.note?'\n'+r.note:'')),
+        'BEGIN:VALARM','TRIGGER:-PT'+rm+'M','ACTION:DISPLAY','DESCRIPTION:'+e('Rendez-vous avec '+r.name+' à '+r.time),'END:VALARM','END:VEVENT','END:VCALENDAR'].join('\r\n')+'\r\n',
+      name='rendez-vous_'+String(r.name||'client').replace(/[^A-Za-z0-9À-ÿ]+/g,'_').slice(0,30)+'_'+r.date+'.ics';
+    try{const f=typeof File==='function'?new File([txt],name,{type:'text/calendar'}):null;
+      if(isIOS()&&standalone()&&canShare(f)){navigator.share({files:[f],title:'Rendez-vous'}).catch(()=>{});return}
+      const u=URL.createObjectURL(new Blob([txt],{type:'text/calendar'})),l=document.createElement('a');l.href=u;if(!isIOS())l.download=name;l.style.display='none';document.body.appendChild(l);l.click();
+      setTimeout(()=>{l.remove();URL.revokeObjectURL(u)},15000);toast('Ouvrez le fichier pour l\'ajouter à votre calendrier')}
+    catch{toast('Impossible de créer le rappel calendrier')}},
   tfold(){P.tOpen=!P.tOpen;render()},
   ntx(d){NT.splice(+d.i,1);render()},
   nfold(){N.fo=!N.fo;render()},
@@ -344,7 +386,7 @@ const NTA={
   nthis(){const m=new Date();N.mon={y:m.getFullYear(),m:m.getMonth()};N.from=iso(new Date(m.getFullYear(),m.getMonth(),1));N.to=iso(new Date(m.getFullYear(),m.getMonth()+1,0));render()},
   nall(){N.mon=null;N.from='';N.to='';N.q='';render()},
   nmic(){REC?REC.stop():micStart()},
-  nsave(){if(REC){REC.stop();return}saveNote(false)},
+  nsave(){if(REC){PS=true;REC.stop();return}saveNote(false)},
   ncancel(){N={...N,...blankN()};render()},
   nedit(d){const n=S.notes.find(x=>x.id===d.id);if(!n)return;N={...N,old:n.id,title:n.title,date:n.date,text:n.text};render();const s=$('#sc');if(s)s.scrollTop=0},
   async ndel(d){const n=S.notes.find(x=>x.id===d.id);if(!n||!confirm('Supprimer la note « '+(n.title||'Sans titre')+' » ?'))return;
@@ -428,7 +470,7 @@ function pvUpdate(){const o=$('#so'),c=$('#scl'),s=$('#sl'),p=$('#pv');if(!o||!c
   const n=Math.floor((cm-om)/sl);
   p.textContent=n?`${n} créneau${n>1?'x':''} par jour : le premier à ${m2t(om)}, le dernier à ${m2t(om+(n-1)*sl)}.`:'La durée est plus longue que la journée d\'ouverture.'}
 function loginView(){document.title='Agenda';lastTab=null;
-  $('#app').innerHTML=`<main class=wrap id=sc><div class=login><img src="icons/icon-192.png" alt=""><h1>${esc(cfg().name)}</h1><p class=sub>Agenda de l'équipe</p><section class=card><h2>Connexion</h2>
+  $('#app').innerHTML=`<main class=wrap id=sc><div class=login><img src="icons/icon-192.png" alt=""><h1 class=brand>${brandHtml(cfg().name)}</h1><p class=sub>Agenda de l'équipe</p><section class=card><h2>Connexion</h2>
   <input id=em type=email placeholder="Adresse e-mail de l'équipe" autocomplete=username><input id=pw type=password placeholder="Mot de passe" autocomplete=current-password>
   <button class="btn gold big" data-a=login>Se connecter</button><p class=hint>Une seule fois : le téléphone reste connecté ensuite.</p></section></div></main>`}
 
@@ -490,9 +532,14 @@ const A={
   async login(){try{await DB.login($('#em').value.trim(),$('#pw').value)}catch{toast('E-mail ou mot de passe incorrect')}},
   async logout(){await DB.logout()},
   async install(){
-    if(!deferred){const ios=isIOS();return modal(`<h3>Installer l'application</h3><ol class=steps>${ios?'<li>Ouvrez cette page dans <b>Safari</b>.</li><li>Touchez <b>Partager</b> (carré avec une flèche).</li><li>Choisissez <b>Sur l\'écran d\'accueil</b>, puis <b>Ajouter</b>.</li>':'<li>Touchez le menu <b>⋮</b> en haut à droite du navigateur.</li><li>Choisissez <b>Installer l\'application</b> (ou <b>Ajouter à l\'écran d\'accueil</b>).</li>'}</ol><button class="btn gold big" data-a=close style="margin-top:14px">OK</button>`)}
-    try{deferred.prompt();const r=await deferred.userChoice;if(r&&r.outcome==='accepted')toast('Installation en cours…')}catch{}
-    deferred=null;refresh()},
+    if(!deferred&&window.__ip)deferred=window.__ip;
+    if(!deferred){const ios=isIOS(),and=isAndroid();
+      if(ios)return modal(iosGuide());
+      const st=and?'<li>Ouvrez cette page dans <b>Chrome</b>.</li><li>Touchez le menu <b>⋮</b> en haut à droite.</li><li>Choisissez <b>Installer l\'application</b> (ou <b>Ajouter à l\'écran d\'accueil</b>), puis confirmez.</li>'
+      :'<li>Utilisez <b>Chrome</b> ou <b>Edge</b>.</li><li>Cliquez sur l\'icône <b>Installer</b> à droite de la barre d\'adresse (ou menu <b>⋮</b> › <b>Installer…</b>).</li>';
+      return modal(`<h3>Installer l'application</h3><ol class=steps>${st}</ol><button class="btn gold big" data-a=close style="margin-top:14px">OK</button>`)}
+    try{const p=deferred;deferred=null;window.__ip=null;p.prompt();const r=await p.userChoice;if(r&&r.outcome==='accepted')toast('Installation en cours…')}catch{}
+    refresh()},
   noinst(){try{localStorage.noinst_t=Date.now()}catch{}refresh()},close:closeModal,none(){},...BKA,...NTA};
 document.addEventListener('click',e=>{const b=e.target.closest('[data-a]');if(b&&A[b.dataset.a])A[b.dataset.a](b.dataset,b)});
 document.addEventListener('input',e=>{const t=e.target,f=t.dataset&&t.dataset.f,b=t.dataset&&t.dataset.b;
@@ -550,7 +597,7 @@ function card(r){const s=stOf(r),u=U[r.urg]||U.normal,tel=intl(r.phone),wa=intl(
   return`<article class="rc ${s}${op?' open':''}" style="--c:${s==='todo'||s==='done'?u.c:ST[s].c}"><div class=rt ${tg}><b>${r.time}</b><small>${dur(d)}</small></div><div class=rb>
   <div class=rcl ${tg} role=button tabindex=0 aria-expanded="${op}"><div class=rn><h4>${esc(r.name)}</h4>${s==='todo'?`<span class=tag><i></i>${u.l}</span>`:`<span class=tag><i></i>${ST[s].l.replace(/s$/,'')}</span>`}</div><div class=ph>${esc(r.phone)}</div>${chev(op)}</div>${info}
   ${op?`<div class=rx>${r.note?`<div class=note><b>Motif :</b> ${esc(r.note)}</div>`:''}${r.perso?`<div class="note pv">🔒 Note personnelle : ${esc(r.perso)}</div>`:''}${why}
-  <div class=acts><a class="act call${tel?'':' off'}" href="tel:+${tel}">${ico('phone')}Appeler</a><a class="act wa${wa?'':' off'}" href="https://wa.me/${wa}?text=${encodeURIComponent(t0)}" target=_blank rel=noopener>${ico('chat')}WhatsApp</a></div>${mini}</div>`:''}</div></article>`}
+  <div class=acts><a class="act call${tel?'':' off'}" href="tel:+${tel}">${ico('phone')}Appeler</a><a class="act wa${wa?'':' off'}" href="https://wa.me/${wa}?text=${encodeURIComponent(t0)}" target=_blank rel=noopener>${ico('chat')}WhatsApp</a>${s==='todo'?`<button class="act cal" data-a=cal data-s="${esc(r.sid)}">${ico('month')}Ajouter au calendrier du téléphone</button>`:''}</div>${mini}</div>`:''}</div></article>`}
 /* --- changement de statut, annuler, reporter --- */
 async function setS(sid,st,x){const r=S.rdv.find(y=>y.sid===sid);if(!r)return;
   if(st==='todo'&&stOf(r)==='cancel'&&!cfg().multi&&busy(r.date,r.time,sid).length)return toast('Ce créneau est déjà pris : reportez ce rendez-vous à une autre date.');
@@ -604,7 +651,7 @@ function setView(){const c=cfg(),sl=+c.slot,rm=c.remind||'both',np=window.Notifi
   <h3 class=sh>Rappels des rendez-vous</h3><div class=qd id=srem data-v="${rm}">${REM.map(([k,l])=>`<button class="pill rem${rm===k?' sel':''}" data-a=setrem data-v=${k}>${l}</button>`).join('')}</div>
   <label class=lbl>Rappel « peu avant » : combien de minutes avant ?<span class=unit><input type=number id=srm data-cs inputmode=numeric min=5 max=1440 value="${+c.remMin||60}"><b>min</b></span></label>
   <div id=cfgstat></div><button class="btn gold big" data-a=savecfg>Enregistrer les réglages</button></section>
-  <section class=card><h2>Notifications du téléphone</h2><p class=hint>Les rappels s'affichent dans l'application. Activez aussi les notifications pour les recevoir comme alertes quand l'application est ouverte ou en arrière-plan. Si elle est complètement fermée, aucun rappel ne peut apparaître.</p>${np==='granted'?'<div class="box ok">✓ Notifications activées</div>':np==='denied'?'<div class="box warn">Notifications bloquées : autorisez-les dans les réglages du navigateur.</div>':np==='none'?'<p class=hint>Non disponibles sur ce navigateur.</p>':'<button class="btn gold big" data-a=notif>Activer les notifications</button>'}</section>
+  <section class=card><h2>Notifications du téléphone</h2><p class=hint>Les rappels s'affichent dans l'application. Activez aussi les notifications pour les recevoir comme alertes quand l'application est ouverte ou en arrière-plan. Si elle est complètement fermée, aucun rappel ne peut apparaître. Pour être prévenu même application fermée : ouvrez un rendez-vous et touchez <b>Ajouter au calendrier du téléphone</b>.</p>${np==='granted'?'<div class="box ok">✓ Notifications activées</div>':np==='denied'?'<div class="box warn">Notifications bloquées : autorisez-les dans les réglages du navigateur.</div>':np==='none'?'<p class=hint>Non disponibles sur ce navigateur.</p>':'<button class="btn gold big" data-a=notif>Activer les notifications</button>'}</section>
   ${bkCard()}${DB.mode==='firebase'?`<section class=card><h2>Compte</h2><p class=hint>Connecté : ${esc(user.email||'')}</p><button class="btn ghost sm" data-a=logout>Se déconnecter</button></section>`:''}`}
 function pvUpdate(){const o=$('#so'),c=$('#scl'),s=$('#sl'),p=$('#pv');if(!o||!c||!s||!p)return;
   const sl=+s.value,om=t2m(o.value||'08:00'),cm=t2m(tz(c.value||'18:00'));
@@ -640,7 +687,7 @@ function cleanNotes(a){const seen=new Set();return a.map((n,i)=>{if(!n||typeof n
 const noteCats=()=>[...new Set(S.notes.map(n=>n.cat).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
 const catLbl=()=>N.fc==='*'?'★ Favoris':N.fc||'Toutes les notes';
 function catFilter(){return`<section class="card catcard"><button class=fold data-a=ncfold aria-expanded="${N.cfo}"><h2>Catégories</h2><span class=hint><b>${esc(catLbl())}</b> ${chev(N.cfo)}</span></button>
-  <div class=cl id=ncl ${N.cfo?'':'hidden'}><button class="cli${!N.fc?' sel':''}" data-a=nfc data-c="">Toutes les notes</button><button class="cli${N.fc==='*'?' sel':''}" data-a=nfc data-c="*">★ Favoris</button>${noteCats().map(c=>`<button class="cli${N.fc===c?' sel':''}" data-a=nfc data-c="${esc(c)}">${esc(c)}</button>`).join('')}</div></section>`}
+  <div class="cl pop" id=ncl ${N.cfo?'':'hidden'}><button class="cli${!N.fc?' sel':''}" data-a=nfc data-c="">Toutes les notes</button><button class="cli${N.fc==='*'?' sel':''}" data-a=nfc data-c="*">★ Favoris</button>${noteCats().map(c=>`<button class="cli${N.fc===c?' sel':''}" data-a=nfc data-c="${esc(c)}">${esc(c)}</button>`).join('')}</div></section>`}
 const nFilt=()=>{const q=norm(N.q).trim();return S.notes.filter(n=>(!N.from||n.date>=N.from)&&(!N.to||n.date<=N.to)&&(!q||norm(n.title+' '+n.text+' '+(n.cat||'')).includes(q))&&(!N.fc||(N.fc==='*'?n.fav:n.cat===N.fc))).slice().sort((a,b)=>(b.pin?1:0)-(a.pin?1:0)||b.date.localeCompare(a.date)||b.created-a.created)};
 const nb=(a,n,i,c)=>`<button class="ib${c}" data-a=${a} data-id="${esc(n.id)}" aria-label="${a}">${ico(i)}</button>`;
 const nCard2=n=>{const c=NC[n.color];return`<article class="nc" style="${c?`background:${c[0]};border-left-color:${c[1]}`:''}" data-a=nedit data-id="${esc(n.id)}"><div class=nh2><b>${n.pin?'📌 ':''}${esc(n.title)||'Sans titre'}</b><span class=hint>${esc(fd(n.date,{day:'numeric',month:'short',year:'numeric'}))}</span></div>${n.cat?`<span class=badge>${esc(n.cat)}</span>`:''}${n.text?`<div class="nt clamp">${esc(n.text)}</div>`:''}<div class=nbtn>${nb('nfav2',n,'star',n.fav?' on fav':'')}${nb('npin2',n,'pin',n.pin?' on pin':'')}${nb('nedit',n,'edit','')}${nb('ndel',n,'trash',' dl')}</div></article>`};
@@ -649,13 +696,13 @@ const nCount2=()=>{const n=nFilt().length;return n+' note'+sx(n)+(n!==S.notes.le
 function updNotesList(){const l=$('#nl');if(l)l.innerHTML=nListHtml2();const c=$('#ncount');if(c)c.textContent=nCount2()}
 function noteEditor(){return`<section class=card><h2>${N.old?'Modifier la note':'Nouvelle note'}</h2>
   <div class=row><label class=lbl>Titre<input data-nf=title value="${esc(N.title)}" placeholder="Ex : Tissus à commander" maxlength=100 autocomplete=off></label><label class=lbl>Date<input type=date data-nf=date value="${esc(N.date)}"></label></div>
-  <div class=lbl>Catégorie</div><button class="fold catb" data-a=ncatfold aria-expanded="${N.co}"><span id=ncatl>${esc(N.cat)||'Choisir une catégorie'}</span>${chev(N.co)}</button>
-  <div class=cl id=ncatp ${N.co?'':'hidden'}><button class="cli${N.cat?'':' sel'}" data-a=ncatpick data-c="">Aucune catégorie</button>${noteCats().map(c=>`<button class="cli${N.cat===c?' sel':''}" data-a=ncatpick data-c="${esc(c)}">${esc(c)}</button>`).join('')}<input data-nf=cat value="${esc(N.cat)}" placeholder="Ou tapez une nouvelle catégorie" maxlength=40 autocomplete=off></div>
+  <div class=lbl>Catégorie</div><div class=catwrap><button class="fold catb" data-a=ncatfold aria-expanded="${N.co}"><span id=ncatl>${esc(N.cat)||'Choisir une catégorie'}</span>${chev(N.co)}</button>
+  <div class="cl pop" id=ncatp ${N.co?'':'hidden'}><button class="cli${N.cat?'':' sel'}" data-a=ncatpick data-c="">Aucune catégorie</button>${noteCats().map(c=>`<button class="cli${N.cat===c?' sel':''}" data-a=ncatpick data-c="${esc(c)}">${esc(c)}</button>`).join('')}<input data-nf=cat value="${esc(N.cat)}" placeholder="Ou tapez une nouvelle catégorie" maxlength=40 autocomplete=off></div></div>
   <div class=lbl>Couleur de la note</div><div class=sw><button class="sw0${N.color?'':' sel'}" data-a=ncol data-c="" aria-label="Sans couleur">∅</button>${Object.entries(NC).map(([k,v])=>`<button class="${N.color===k?'sel':''}" style="background:${v[0]};border-color:${v[1]}" data-a=ncol data-c=${k} aria-label="${k}"></button>`).join('')}</div>
   <div class=nact><button class="btn ghost tg${N.fav?' on fav':''}" data-a=nfavE>${ico('star')}Favori</button><button class="btn ghost tg${N.pin?' on pin':''}" data-a=npinE>${ico('pin')}Épingler</button></div>
   <textarea id=ntx data-nf=text maxlength=5000 placeholder="Écrivez votre note ou touchez Dicter…" style="margin-top:10px">${esc(N.text)}</textarea>
   <div class=nact><button class="btn ${N.rec?'rec':'ghost'}" data-a=nmic>${ico('mic')}${N.rec?'Arrêter':'Dicter'}</button><button class="btn gold" data-a=nsave>Enregistrer</button><button class="btn ghost" data-a=ncancel>Fermer</button></div>
-  ${N.rec?'<p class=hint style="margin:8px 0 0">Parlez maintenant. Touchez « Arrêter » : la note est enregistrée.</p>':''}<p class=hint id=nstat style="margin:8px 0 0">Enregistrement automatique pendant que vous écrivez.</p></section>`}
+  ${N.rec?'<p class=hint style="margin:8px 0 0">Parlez maintenant. Touchez « Arrêter » quand vous avez fini, puis « Enregistrer ».</p>':''}<p class=hint id=nstat style="margin:8px 0 0">La note n'est gardée que lorsque vous touchez « Enregistrer ».</p></section>`}
 function notesView(){
   if(DB.mode!=='demo')return`<section class=card><h2>Bloc-notes</h2><p class=hint>Le bloc-notes fonctionne uniquement avec l'enregistrement sur ce téléphone.</p></section>`;
   const act=!!(N.from||N.to);
@@ -674,19 +721,19 @@ async function autoP(){if(!(N.title.trim()||N.text.trim()))return;if(await persi
 async function saveNote(auto){if(!(N.title.trim()||N.text.trim()))return toast('Écrivez ou dictez une note');clearTimeout(AT);if(!await persistNote())return;
   if(auto){toast('Note vocale enregistrée');render();return}nReset();toast('Note enregistrée');render()}
 Object.assign(A,{nnew(){nReset();N.ed=true;render()},
-  async ncancel(){clearTimeout(AT);if(N.title.trim()||N.text.trim())await persistNote();nReset();render()},
+  ncancel(){const o=N.old&&S.notes.find(x=>x.id===N.old),dirty=o?(o.title!==N.title.trim()||o.text!==N.text.trim()||(o.cat||'')!==N.cat.trim()||(o.color||'')!==(N.color||'')||!!o.fav!==!!N.fav||!!o.pin!==!!N.pin||o.date!==N.date):!!(N.title.trim()||N.text.trim());
+    if(dirty&&!confirm('Fermer sans enregistrer cette note ?'))return;if(REC){PS=false;REC.stop()}nReset();render()},
   nedit(d){const n=S.notes.find(x=>x.id===d.id);if(!n)return;N={...N,old:n.id,title:n.title,date:n.date,text:n.text,cat:n.cat||'',color:n.color||'',fav:!!n.fav,pin:!!n.pin,ed:true};render();const s=$('#sc');if(s)s.scrollTop=0},
   async ndel(d){const n=S.notes.find(x=>x.id===d.id);if(!n||!confirm('Supprimer la note « '+(n.title||'Sans titre')+' » ?'))return;try{await DB.delNote(d.id);if(N.old===d.id)nReset();toast('Note supprimée');render()}catch{toast('Erreur, réessayez')}},
   async nfav2(d){const n=S.notes.find(x=>x.id===d.id);if(n){await DB.putNote({...n,fav:!n.fav,updated:Date.now()});toast(n.fav?'Retirée des favoris':'Ajoutée aux favoris')}},
   async npin2(d){const n=S.notes.find(x=>x.id===d.id);if(n){await DB.putNote({...n,pin:!n.pin,updated:Date.now()});toast(n.pin?'Note désépinglée':'Note épinglée en haut')}},
-  nfavE(){N.fav=!N.fav;render();autoP()},npinE(){N.pin=!N.pin;render();autoP()},ncol(d){N.color=d.c;render();autoP()},nfc(d){N.fc=d.c;render()},ncfold(){N.cfo=!N.cfo;render()},ncatfold(){N.co=!N.co;render()},ncatpick(d){N.cat=d.c;render();autoP()},ctog(d){OPEN.has(d.s)?OPEN.delete(d.s):OPEN.add(d.s);render()},
+  nfavE(){N.fav=!N.fav;render()},npinE(){N.pin=!N.pin;render()},ncol(d){N.color=d.c;render()},nfc(d){N.fc=d.c;N.cfo=false;render()},ncfold(){N.cfo=!N.cfo;render()},ncatfold(){N.co=!N.co;render()},ncatpick(d){N.cat=d.c;N.co=false;render()},ctog(d){OPEN.has(d.s)?OPEN.delete(d.s):OPEN.add(d.s);render()},
   nper(d){const t=today(),n=new Date();const R={today:[t,t],w7:[iso(add(n,-6)),t]}[d.k];N.mon=null;N.from=R[0];N.to=R[1];render()}});
 /* --- écouteurs : filtre période, report, enregistrement automatique des notes, réglages --- */
 document.addEventListener('input',e=>{const t=e.target,ds=t.dataset||{};
   if(ds.p==='pq'){P.pq=t.value;const l=$('#pl');if(l)l.innerHTML=pBody()}
   if(ds.rp==='reason'&&RP)RP.reason=t.value;
   if(ds.nf==='cat'){const l=$('#ncatl');if(l)l.textContent=N.cat||'Choisir une catégorie'}
-  if(ds.nf==='title'||ds.nf==='text'||ds.nf==='cat'){clearTimeout(AT);AT=setTimeout(autoP,900)}
   if('cs' in ds)pvUpdate()});
 document.addEventListener('change',e=>{const t=e.target,ds=t.dataset||{};
   if(ds.p==='pf'||ds.p==='pt'){P[ds.p]=t.value;P.pre='';if(P.pf&&P.pt&&P.pt<P.pf){ds.p==='pf'?P.pt=P.pf:P.pf=P.pt}render()}
@@ -696,15 +743,16 @@ document.addEventListener('change',e=>{const t=e.target,ds=t.dataset||{};
 function render(){if(!DB)return;if(!user)return loginView();const c=cfg();document.title=c.name+' – Agenda';
   const old=$('#sc'),y=old&&lastTab===P.tab?old.scrollTop:0;lastTab=P.tab;const IN=['#tpanel','#ncl','#ncatp'],ky=IN.map(q=>{const e=$(q);return e?e.scrollTop:0});
   const tabs=[['agenda','Agenda'],['notes','Notes'],['add','Ajouter'],['block','Bloquer'],['set','Réglages']];
-  const v={agenda:agendaView,notes:notesView,add:addView,block:blockView,set:setView}[P.tab](),nm=esc(c.name).replace(/^(ven)(.*)$/i,'$1<span>$2</span>');
+  const v={agenda:agendaView,notes:notesView,add:addView,block:blockView,set:setView}[P.tab](),nm=brandHtml(c.name);
   $('#app').innerHTML=`<header class=top><img src="icons/icon-192.png" alt=""><div><div class=brand>${nm}</div><div class=sub>Agenda des rendez-vous</div></div>${instBtn()}</header>${ntHtml()}
-  <main class="wrap${P.tab==='notes'?' fill':''}" id=sc>${P.tab==='set'||P.tab==='notes'?'':`<div id=inst>${bkHtml()}</div>`}${v}</main>
+  <main class="wrap" id=sc>${P.tab==='set'||P.tab==='notes'?'':`<div id=inst>${bkHtml()}</div>`}${v}</main>
   <nav class=bnav>${tabs.map(([k,l])=>`<button class="n-${k}${k==='add'?' plus':''}${P.tab===k?' sel':''}" data-a=tab data-t=${k} aria-label="${l}"><span class=ni>${ico(k)}</span><span class=nl>${l}</span></button>`).join('')}</nav>`;
   $('#sc').scrollTop=y;IN.forEach((q,i)=>{const e=$(q);if(e&&ky[i])e.scrollTop=ky[i]});P.tY=null;if(P.tab==='set')pvUpdate()}
 
+/* un rendez-vous ne s'enregistre que sur appui du bouton, jamais deux fois d'affilée */
+{const _sv=A.save;A.save=async function(){if(A._b)return;A._b=true;try{await _sv()}finally{A._b=false}}}
 (async function boot(){
   DB=Local;
   if(C.firebase){try{const b='https://www.gstatic.com/firebasejs/10.12.2/firebase-';await loadJs(b+'app-compat.js');await loadJs(b+'firestore-compat.js');await loadJs(b+'auth-compat.js');DB=FB}catch{toast('Connexion impossible : mode local')}}
-  if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
   try{if(navigator.storage&&navigator.storage.persist&&!/firefox/i.test(navigator.userAgent))Promise.resolve(navigator.storage.persist()).catch(()=>{})}catch{}
   DB.init(refresh);checkNotifs();setInterval(()=>{refresh();checkNotifs()},60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkNotifs()})})();

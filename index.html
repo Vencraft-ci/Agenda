@@ -10,8 +10,14 @@
 <meta name="apple-mobile-web-app-title" content="VenCraft">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet"></noscript>
 <link rel="stylesheet" href="style.css">
+<script>
+/* le service worker démarre tout de suite (nécessaire pour pouvoir installer l'application) ; l'évènement d'installation est gardé dès le début */
+window.__ip=null;addEventListener('beforeinstallprompt',function(e){e.preventDefault();window.__ip=e});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(function(){});
+</script>
 </head><body><div id="app"></div><div id="modal"></div><div id="toast"></div><input type="file" id="rf" class="rfi" tabindex="-1" aria-hidden="true">
 <noscript>Activez JavaScript pour utiliser l'agenda.</noscript>
 <script src="config.js"></script><script src="app.js"></script></body></html>
